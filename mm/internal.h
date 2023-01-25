@@ -861,4 +861,6 @@ struct folio *try_grab_folio(struct page *page, int refs, unsigned int flags);
 
 DECLARE_PER_CPU(struct per_cpu_nodestat, boot_nodestats);
 
+void wakeup_minfkb_throttle(void);
+
 #endif	/* __MM_INTERNAL_H */

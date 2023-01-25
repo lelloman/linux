@@ -4211,6 +4211,7 @@ try_this_zone:
 			return page;
 		} else {
 #ifdef CONFIG_DEFERRED_STRUCT_PAGE_INIT
+		
 			/* Try again if zone has deferred pages */
 			if (static_branch_unlikely(&deferred_pages)) {
 				if (_deferred_grow_zone(zone, order))
@@ -4967,6 +4968,8 @@ retry_cpuset:
 			goto nopage;
 	}
 
+	wakeup_minfkb_throttle();
+
 	if (alloc_flags & ALLOC_KSWAPD)
 		wake_all_kswapds(order, gfp_mask, ac);
 
@@ -4975,6 +4978,7 @@ retry_cpuset:
 	 * that first
 	 */
 	page = get_page_from_freelist(gfp_mask, order, alloc_flags, ac);
+
 	if (page)
 		goto got_pg;
 
