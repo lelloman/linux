@@ -4366,8 +4366,17 @@ static void kswapd_try_to_sleep(pg_data_t *pgdat, int alloc_order, int reclaim_o
 	 */
 	if (!remaining &&
 	    prepare_kswapd_sleep(pgdat, reclaim_order, highest_zoneidx)) {
-		trace_mm_vmscan_kswapd_sleep(pgdat->node_id);
+		struct zone *zone;
+		struct zoneref *z;
 
+		trace_mm_vmscan_kswapd_sleep(pgdat->node_id);
+		
+		for_each_zone_zonelist(zone, z, pgdat->node_zonelists, highest_zoneidx) {
+			if (!managed_zone(zone) || !zone->atomic_boost)
+				continue;
+			zone->atomic_boost = 0;
+			printk("atomic boosting remove zone %s to %ld\n", zone->name, zone->atomic_boost);
+		}
 		/*
 		 * vmstat counters are not perfectly accurate and the estimated
 		 * value for counters such as NR_FREE_PAGES can deviate from the
