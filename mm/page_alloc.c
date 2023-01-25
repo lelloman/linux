@@ -3989,7 +3989,7 @@ static inline bool zone_watermark_fast(struct zone *z, unsigned int order,
 	 * point where boosting is ignored so that kswapd is woken up
 	 * when below the low watermark.
 	 */
-	if (unlikely(!order && (gfp_mask & __GFP_ATOMIC) && z->watermark_boost
+	if (unlikely(/*!order && */(gfp_mask & __GFP_ATOMIC) && (z->watermark_boost || z->atomic_boost)
 		&& ((alloc_flags & ALLOC_WMARK_MASK) == WMARK_MIN))) {
 		mark = z->_watermark[WMARK_MIN];
 		return __zone_watermark_ok(z, order, mark, highest_zoneidx,
@@ -4703,6 +4703,7 @@ static void wake_all_kswapds(unsigned int order, gfp_t gfp_mask,
 		if (last_pgdat != zone->zone_pgdat) {
 			wakeup_kswapd(zone, gfp_mask, order, highest_zoneidx);
 			last_pgdat = zone->zone_pgdat;
+			handle_atomic_boost(zone);
 		}
 	}
 }
