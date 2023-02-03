@@ -5,31 +5,35 @@
 #include <linux/sched.h>
 #include <linux/mm.h>
 #include <linux/proc_fs.h>
+#include "internal.h"
 
-static struct task_struct *my_thread;
-static DECLARE_WAIT_QUEUE_HEAD(wq);
-static int condition = 0;
+#define str_buf_size 512
 
-static const size_t str_buf_size = 512;
-
-static u64 min_min_free_kbytes = 5000;
-static u64 max_min_free_kbytes = 160000;
+static unsigned long min_boost = 1 << 10;
 
 static u8 run_counter = 0;
-static u8 run_interval = 2;
-static u64 min_scale_down_interval_ns = 5000000000;
 
-bool enabled = true;
+static bool enabled = true;
+static u8 run_interval = 1;
+static u64 min_increase_interval_ns = NSEC_PER_MSEC * 1000;
+static u64 min_decrease_interval_ns = NSEC_PER_SEC * 10;
+static unsigned long boost_step = 25000;
+static unsigned long int low_ratio_numerator = 3;
+static unsigned long int low_ratio_denominator = 8;
 
-static const char* root_dir_name = "mfkb";
-static struct proc_dir_entry* root_dir_entry;
 
-static struct proc_dir_entry *enabled_entry;
-static const char* enabled_entry_name = "enabled";
+static const char* conf_entry_name = "mfkb";
+static struct proc_dir_entry* conf_entry;
 
-static ssize_t enabled_write(struct file *file, const char __user *ubuf, size_t count, loff_t *ppos)
+static u64 last_scale_up_time_ns = 0;
+static u64 last_scale_down_time_ns = 0;
+
+static ssize_t conf_write(struct file *file, const char __user *ubuf, size_t count, loff_t *ppos)
 {
-    int in_value, scanned_values;
+    int in_enabled, in_run_interval, scanned_values;
+    u64 in_min_decrease_ns, in_min_increase_ns;
+    unsigned long int in_boost_step, in_numerator, in_denominator;
+    struct zone *zone;
     char buf[str_buf_size];
     if (*ppos > 0 || count > str_buf_size)
         return -EFAULT;
@@ -37,27 +41,40 @@ static ssize_t enabled_write(struct file *file, const char __user *ubuf, size_t 
     if (copy_from_user(buf, ubuf, count))
         return -EFAULT;
 
-    scanned_values = sscanf(buf, "%d", &in_value);
-    if (scanned_values != 1) 
+    scanned_values = sscanf(buf, "%d %d %lld %lld %ld %ld %ld", &in_enabled, &in_run_interval, &in_min_increase_ns, &in_min_decrease_ns, &in_boost_step, &in_numerator, &in_denominator);
+    if (scanned_values != 7) 
         return -EFAULT;
 
-    enabled = in_value;
+    enabled = in_enabled;
+    run_interval = in_run_interval;
+    min_increase_interval_ns = in_min_increase_ns;
+    min_decrease_interval_ns = in_min_decrease_ns;
+    boost_step = in_boost_step;
+    low_ratio_numerator = in_numerator;
+    low_ratio_denominator = in_denominator;
+
+    if (!enabled) {
+        for_each_populated_zone(zone) {
+            zone->atomic_boost = 0;
+        }
+    }
+
     printk("[ASD] mfkb %s\n", enabled ? "ENABLED" : "off");
     
 	return count;
 }
 
-static ssize_t enabled_read(struct file *file, char __user *ubuf, size_t count, loff_t *ppos)
+static ssize_t conf_read(struct file *file, char __user *ubuf, size_t count, loff_t *ppos)
 {
     int len;
     char buf[str_buf_size];
-
-    if (*ppos > 0)
-        return 0;
+    printk("[ASD] conf read %p %d %p", ubuf, count, ppos);
+     if (*ppos > 0)
+         return 0;
     if (count < str_buf_size)
         return -EFAULT;
     
-    len = sprintf(buf, "%d", enabled);
+    len = sprintf(buf, "%d %d %lld %lld %ld %ld %ld", enabled, run_interval, min_increase_interval_ns, min_decrease_interval_ns, boost_step, low_ratio_numerator, low_ratio_denominator);
 
     if (copy_to_user(ubuf, buf, len))
         return -EFAULT;
@@ -66,109 +83,75 @@ static ssize_t enabled_read(struct file *file, char __user *ubuf, size_t count, 
     return len;
 }
 
-static struct proc_ops enabled_ops = 
+static struct proc_ops conf_ops = 
 {
-	.proc_write = enabled_write,
-    .proc_read = enabled_read
+	.proc_write = conf_write,
+    .proc_read = conf_read
 };
 
-int my_thread_func(void *data)
+static void handle_atomic_boost(struct zone* zone)
 {
-    static u64 last_scale_time_ns = 0;
-    while (!kthread_should_stop()) {
-        struct zone *zone;
-        bool low = false, high = true;
-        unsigned long sleep_us = 0;
-
-
-        if (run_counter++ % run_interval) {
-            wait_event_interruptible(wq, condition != 0);
-            continue;
+    bool low, high;
+    u64 now;
+    unsigned long int min_watermark, max_watermark, free_pages, next_boost, max_boost;
+    min_watermark = min_wmark_pages(zone);
+    max_watermark = high_wmark_pages(zone);
+    free_pages = zone_page_state(zone, NR_FREE_PAGES);
+    low = free_pages*low_ratio_denominator < min_watermark*low_ratio_numerator;
+    high = free_pages > max_watermark;
+    max_boost = div_u64(zone->present_pages, 4);
+    if (low) {
+        now = ktime_get_ns();
+        if (now - last_scale_up_time_ns > min_increase_interval_ns) {
+            last_scale_up_time_ns = now;
+            next_boost = zone->atomic_boost + boost_step;
+            zone->atomic_boost = next_boost > max_boost ? max_boost : next_boost;
+            printk("[ASD] MFKBOP increasing %s atomic boost to %ld\n", zone->name, zone->atomic_boost);
         }
-
-        condition = 0;
-        //printk("[ASD] Thread woke up\n");
-
-        for_each_populated_zone(zone) {
-            unsigned long min_watermark, max_watermark, free_pages;
-            bool zone_low, zone_high;
-            min_watermark = min_wmark_pages(zone);
-            max_watermark = high_wmark_pages(zone);
-            free_pages = zone_page_state(zone, NR_FREE_PAGES);
-            zone_low = free_pages*3 < min_watermark*2;
-            zone_high = free_pages > max_watermark;
-            low = low || zone_low;
-            high = high && zone_high;
-        }
-        if (low) {
-            u64 new_min_free_kbytes = min_free_kbytes * 2;
-            if (new_min_free_kbytes > max_min_free_kbytes) {
-                printk("[ASD] Cannot scale up, min free kbytes is at max.\n");
-            } else {
-                printk("[ASD] MFKBOP recalculating min free kbytes memory is LOW -> SCALING UP %d\n", new_min_free_kbytes);
-                min_free_kbytes = new_min_free_kbytes;
-                last_scale_time_ns = ktime_get_ns();
-                setup_per_zone_wmarks();
-                sleep_us = 1000;
-            }
-        } else if (high) {
-            if (min_free_kbytes == min_min_free_kbytes) {
-                //printk("[ASD] high memory but already at minimum scaling, ignoring.\n");
-                wait_event_interruptible(wq, condition != 0);
-            } else {
-                u64 elapsed = ktime_get_ns() - last_scale_time_ns;
-                bool cooled_down = elapsed > min_scale_down_interval_ns;
-                if (cooled_down) {
-                    min_free_kbytes /= 2;
-                    min_free_kbytes = min_free_kbytes < min_min_free_kbytes ? min_min_free_kbytes : min_free_kbytes;
-                    last_scale_time_ns = ktime_get_ns();
-                    setup_per_zone_wmarks();
-                    printk("[ASD] MFKBOP memory is HIGH elapsed ns %lld -> SCALING DOWN %d\n", elapsed, min_free_kbytes);
-                    sleep_us = 1000;
-                } else {
-                    sleep_us = 100;
-                    //printk("[ASD] memory is HIGH elapsed ns %lld -> ignoring\n", elapsed);
-                }
-            }
-        } else {
-            sleep_us = 500;
-        }
-
-        if (sleep_us) {
-            //set_current_state(TASK_INTERRUPTIBLE);
-            //schedule_timeout(msecs_to_jiffies(1));
-            usleep_range(sleep_us, sleep_us+100);
-        } else {
-            wait_event_interruptible(wq, condition != 0);
-        }
+        return;
     }
 
-    return 0;
+    if (high && zone->atomic_boost) {
+        now = ktime_get_ns();
+        if (now - last_scale_up_time_ns > min_decrease_interval_ns && now - last_scale_down_time_ns > min_decrease_interval_ns) {
+            next_boost = zone->atomic_boost > boost_step ? zone->atomic_boost - boost_step : 0;
+            zone->atomic_boost = next_boost < min_boost ? 0 : next_boost;
+            printk("[ASD] MFKBOP decreasing %s atomic boost to %ld\n", zone->name, zone->atomic_boost);
+        }
+    }
 }
 
 static int __init my_module_init(void)
 {
-    root_dir_entry = proc_mkdir(root_dir_name, NULL);
-    enabled_entry = proc_create(enabled_entry_name, 0660, root_dir_entry, &enabled_ops);
+    conf_entry = proc_create(conf_entry_name, 0660, NULL, &conf_ops);
 
-    my_thread = kthread_run(my_thread_func, NULL, "my_thread");
-    if (IS_ERR(my_thread)) {
-        return -1;
-    }
-    printk("[ASD] kthread started");
     return 0;
 }
 
 static void __exit my_module_exit(void)
 {
-    kthread_stop(my_thread);
+    
 }
 
-void wakeup_minfkb_throttle(void)
+void wakeup_minfkb_throttle(const struct alloc_context* ac)
 {
-    if (enabled) {
-        condition = 1;
-        wake_up_interruptible(&wq);
+    if (!(run_counter++ % run_interval) && enabled) {
+        //struct zoneref *z;
+        struct zone *zone;
+        //pg_data_t *last_pgdat = NULL;
+        //enum zone_type highest_zoneidx = ac->highest_zoneidx;
+        // for_each_zone_zonelist_nodemask(zone, z, ac->zonelist, highest_zoneidx,
+		// 			ac->nodemask) {
+        //     if (!populated_zone(zone))
+        //         continue;
+        //     if (last_pgdat != zone->zone_pgdat) {
+        //         handle_atomic_boost(zone);
+        //         last_pgdat = zone->zone_pgdat;
+        //     }
+        // }
+        for_each_populated_zone(zone) {
+            handle_atomic_boost(zone);
+        }
     }
 }
 

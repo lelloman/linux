@@ -372,10 +372,10 @@ enum zone_watermarks {
 #define NR_PCP_ORDER_WIDTH 8
 #define NR_PCP_ORDER_MASK ((1<<NR_PCP_ORDER_WIDTH) - 1)
 
-#define min_wmark_pages(z) (z->_watermark[WMARK_MIN] + z->watermark_boost)
-#define low_wmark_pages(z) (z->_watermark[WMARK_LOW] + z->watermark_boost)
-#define high_wmark_pages(z) (z->_watermark[WMARK_HIGH] + z->watermark_boost)
-#define wmark_pages(z, i) (z->_watermark[i] + z->watermark_boost)
+#define min_wmark_pages(z) (z->_watermark[WMARK_MIN] + z->watermark_boost + z->atomic_boost)
+#define low_wmark_pages(z) (z->_watermark[WMARK_LOW] + z->watermark_boost + z->atomic_boost)
+#define high_wmark_pages(z) (z->_watermark[WMARK_HIGH] + z->watermark_boost + z->atomic_boost)
+#define wmark_pages(z, i) (z->_watermark[i] + z->watermark_boost + z->atomic_boost)
 
 /* Fields and list protected by pagesets local_lock in page_alloc.c */
 struct per_cpu_pages {
@@ -514,6 +514,8 @@ struct zone {
 	/* zone watermarks, access with *_wmark_pages(zone) macros */
 	unsigned long _watermark[NR_WMARK];
 	unsigned long watermark_boost;
+	unsigned long atomic_boost;
+
 
 	unsigned long nr_reserved_highatomic;
 

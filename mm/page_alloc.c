@@ -4922,6 +4922,8 @@ __alloc_pages_slowpath(gfp_t gfp_mask, unsigned int order,
 	int no_progress_loops;
 	unsigned int cpuset_mems_cookie;
 	int reserve_flags;
+	
+	wakeup_minfkb_throttle(ac);
 
 	/*
 	 * We also sanity check to catch abuse of atomic reserves being used by
@@ -4967,8 +4969,6 @@ retry_cpuset:
 		if (!z->zone)
 			goto nopage;
 	}
-
-	wakeup_minfkb_throttle();
 
 	if (alloc_flags & ALLOC_KSWAPD)
 		wake_all_kswapds(order, gfp_mask, ac);
