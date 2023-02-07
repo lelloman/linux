@@ -3989,7 +3989,7 @@ static inline bool zone_watermark_fast(struct zone *z, unsigned int order,
 	 * point where boosting is ignored so that kswapd is woken up
 	 * when below the low watermark.
 	 */
-	if (unlikely(!order && (gfp_mask & __GFP_ATOMIC) && z->watermark_boost
+	if (unlikely(/*!order && */(gfp_mask & __GFP_ATOMIC) && z->watermark_boost && z->atomic_boost
 		&& ((alloc_flags & ALLOC_WMARK_MASK) == WMARK_MIN))) {
 		mark = z->_watermark[WMARK_MIN];
 		return __zone_watermark_ok(z, order, mark, highest_zoneidx,
@@ -4211,7 +4211,6 @@ try_this_zone:
 			return page;
 		} else {
 #ifdef CONFIG_DEFERRED_STRUCT_PAGE_INIT
-		
 			/* Try again if zone has deferred pages */
 			if (static_branch_unlikely(&deferred_pages)) {
 				if (_deferred_grow_zone(zone, order))
@@ -4704,6 +4703,7 @@ static void wake_all_kswapds(unsigned int order, gfp_t gfp_mask,
 		if (last_pgdat != zone->zone_pgdat) {
 			wakeup_kswapd(zone, gfp_mask, order, highest_zoneidx);
 			last_pgdat = zone->zone_pgdat;
+			handle_atomic_boost(zone);
 		}
 	}
 }
@@ -4922,8 +4922,6 @@ __alloc_pages_slowpath(gfp_t gfp_mask, unsigned int order,
 	int no_progress_loops;
 	unsigned int cpuset_mems_cookie;
 	int reserve_flags;
-	
-	wakeup_minfkb_throttle(ac);
 
 	/*
 	 * We also sanity check to catch abuse of atomic reserves being used by
@@ -4978,7 +4976,6 @@ retry_cpuset:
 	 * that first
 	 */
 	page = get_page_from_freelist(gfp_mask, order, alloc_flags, ac);
-
 	if (page)
 		goto got_pg;
 

@@ -7,11 +7,7 @@
 #include <linux/proc_fs.h>
 #include "internal.h"
 
-#define str_buf_size 512
-
-static unsigned long min_boost = 1 << 10;
-
-static u8 run_counter = 0;
+#define BUFSIZE 512
 
 static bool enabled = true;
 static u8 run_interval = 1;
@@ -22,11 +18,8 @@ static unsigned long int low_ratio_numerator = 3;
 static unsigned long int low_ratio_denominator = 8;
 
 
-static const char* conf_entry_name = "mfkb";
+static const char* conf_entry_name = "atomic_boost_conf";
 static struct proc_dir_entry* conf_entry;
-
-static u64 last_scale_up_time_ns = 0;
-static u64 last_scale_down_time_ns = 0;
 
 static ssize_t conf_write(struct file *file, const char __user *ubuf, size_t count, loff_t *ppos)
 {
@@ -34,44 +27,50 @@ static ssize_t conf_write(struct file *file, const char __user *ubuf, size_t cou
     u64 in_min_decrease_ns, in_min_increase_ns;
     unsigned long int in_boost_step, in_numerator, in_denominator;
     struct zone *zone;
-    char buf[str_buf_size];
-    if (*ppos > 0 || count > str_buf_size)
-        return -EFAULT;
+    char buf[BUFSIZE];
+    if (*ppos > 0 || count > BUFSIZE || count == 0)
+        return 0;
 
     if (copy_from_user(buf, ubuf, count))
         return -EFAULT;
 
+    if (count == 1 && buf[0] == 10) 
+        return 1;
+
     scanned_values = sscanf(buf, "%d %d %lld %lld %ld %ld %ld", &in_enabled, &in_run_interval, &in_min_increase_ns, &in_min_decrease_ns, &in_boost_step, &in_numerator, &in_denominator);
-    if (scanned_values != 7) 
-        return -EFAULT;
-
-    enabled = in_enabled;
-    run_interval = in_run_interval;
-    min_increase_interval_ns = in_min_increase_ns;
-    min_decrease_interval_ns = in_min_decrease_ns;
-    boost_step = in_boost_step;
-    low_ratio_numerator = in_numerator;
-    low_ratio_denominator = in_denominator;
-
-    if (!enabled) {
-        for_each_populated_zone(zone) {
-            zone->atomic_boost = 0;
+    if (scanned_values > 0) {
+        enabled = in_enabled;
+        if (!enabled) {
+            for_each_populated_zone(zone) {
+                zone->atomic_boost = 0;
+            }
         }
+        printk("atomic boost %s\n", enabled ? "ENABLED" : "off");
+        if (scanned_values == 1)
+            return count;
     }
 
-    printk("[ASD] mfkb %s\n", enabled ? "ENABLED" : "off");
-    
-	return count;
+    if (scanned_values == 7) {
+        run_interval = in_run_interval;
+        min_increase_interval_ns = in_min_increase_ns;
+        min_decrease_interval_ns = in_min_decrease_ns;
+        boost_step = in_boost_step;
+        low_ratio_numerator = in_numerator;
+        low_ratio_denominator = in_denominator;
+        
+        printk("atomic boost set all params\n");
+    	return count;
+    }
+    return -EINVAL;
 }
 
 static ssize_t conf_read(struct file *file, char __user *ubuf, size_t count, loff_t *ppos)
 {
     int len;
-    char buf[str_buf_size];
-    printk("[ASD] conf read %p %d %p", ubuf, count, ppos);
+    char buf[BUFSIZE];
      if (*ppos > 0)
          return 0;
-    if (count < str_buf_size)
+    if (count < BUFSIZE)
         return -EFAULT;
     
     len = sprintf(buf, "%d %d %lld %lld %ld %ld %ld", enabled, run_interval, min_increase_interval_ns, min_decrease_interval_ns, boost_step, low_ratio_numerator, low_ratio_denominator);
@@ -89,35 +88,19 @@ static struct proc_ops conf_ops =
     .proc_read = conf_read
 };
 
-static void handle_atomic_boost(struct zone* zone)
+static void __handle_atomic_boost(struct zone* zone)
 {
-    bool low, high;
-    u64 now;
-    unsigned long int min_watermark, max_watermark, free_pages, next_boost, max_boost;
-    min_watermark = min_wmark_pages(zone);
-    max_watermark = high_wmark_pages(zone);
-    free_pages = zone_page_state(zone, NR_FREE_PAGES);
-    low = free_pages*low_ratio_denominator < min_watermark*low_ratio_numerator;
-    high = free_pages > max_watermark;
-    max_boost = div_u64(zone->present_pages, 4);
-    if (low) {
-        now = ktime_get_ns();
-        if (now - last_scale_up_time_ns > min_increase_interval_ns) {
-            last_scale_up_time_ns = now;
-            next_boost = zone->atomic_boost + boost_step;
-            zone->atomic_boost = next_boost > max_boost ? max_boost : next_boost;
-            printk("[ASD] MFKBOP increasing %s atomic boost to %ld\n", zone->name, zone->atomic_boost);
-        }
-        return;
-    }
+    unsigned long int min_watermark, free_pages;
 
-    if (high && zone->atomic_boost) {
-        now = ktime_get_ns();
-        if (now - last_scale_up_time_ns > min_decrease_interval_ns && now - last_scale_down_time_ns > min_decrease_interval_ns) {
-            next_boost = zone->atomic_boost > boost_step ? zone->atomic_boost - boost_step : 0;
-            zone->atomic_boost = next_boost < min_boost ? 0 : next_boost;
-            printk("[ASD] MFKBOP decreasing %s atomic boost to %ld\n", zone->name, zone->atomic_boost);
-        }
+    if (zone->atomic_boost)
+        return;
+
+    min_watermark = min_wmark_pages(zone);
+    free_pages = zone_page_state(zone, NR_FREE_PAGES);
+    if (free_pages*low_ratio_denominator < min_watermark*low_ratio_numerator) {
+        unsigned long int max_boost = div_u64(zone->present_pages, 6);
+        zone->atomic_boost = min_t(unsigned long int, max_boost, boost_step);
+        printk("atomic boosting zone %s to %ld\n", zone->name, zone->atomic_boost);
     }
 }
 
@@ -133,25 +116,10 @@ static void __exit my_module_exit(void)
     
 }
 
-void wakeup_minfkb_throttle(const struct alloc_context* ac)
+void handle_atomic_boost(struct zone* zone)
 {
-    if (!(run_counter++ % run_interval) && enabled) {
-        //struct zoneref *z;
-        struct zone *zone;
-        //pg_data_t *last_pgdat = NULL;
-        //enum zone_type highest_zoneidx = ac->highest_zoneidx;
-        // for_each_zone_zonelist_nodemask(zone, z, ac->zonelist, highest_zoneidx,
-		// 			ac->nodemask) {
-        //     if (!populated_zone(zone))
-        //         continue;
-        //     if (last_pgdat != zone->zone_pgdat) {
-        //         handle_atomic_boost(zone);
-        //         last_pgdat = zone->zone_pgdat;
-        //     }
-        // }
-        for_each_populated_zone(zone) {
-            handle_atomic_boost(zone);
-        }
+    if (enabled) {
+        __handle_atomic_boost(zone);
     }
 }
 
