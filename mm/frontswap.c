@@ -265,6 +265,36 @@ void __frontswap_invalidate_area(unsigned type)
 	bitmap_zero(sis->frontswap_map, sis->max);
 }
 
+bool __frontswap_remove_from_lru(swp_entry_t swpentry)
+{
+	int type = swp_type(swpentry);
+	struct swap_info_struct *sis = swap_info[type];
+	pgoff_t offset = swp_offset(swpentry);
+
+	VM_BUG_ON(!frontswap_ops);
+	VM_BUG_ON(sis == NULL);
+
+	if (!__frontswap_test(sis, offset))
+		return false;
+
+	return frontswap_ops->remove_from_lru(swpentry);
+}
+
+void __frontswap_insert_lru(swp_entry_t swpentry)
+{
+	int type = swp_type(swpentry);
+	struct swap_info_struct *sis = swap_info[type];
+	pgoff_t offset = swp_offset(swpentry);
+
+	VM_BUG_ON(!frontswap_ops);
+	VM_BUG_ON(sis == NULL);
+
+	if (!__frontswap_test(sis, offset))
+		return;
+
+	frontswap_ops->insert_lru(swpentry);
+}
+
 static int __init init_frontswap(void)
 {
 #ifdef CONFIG_DEBUG_FS

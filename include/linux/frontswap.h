@@ -13,6 +13,8 @@ struct frontswap_ops {
 	int (*load)(unsigned, pgoff_t, struct page *, bool *); /* load a page */
 	void (*invalidate_page)(unsigned, pgoff_t); /* page no longer needed */
 	void (*invalidate_area)(unsigned); /* swap type just swapoff'ed */
+	bool (*remove_from_lru)(swp_entry_t);
+	void (*insert_lru)(swp_entry_t);
 };
 
 int frontswap_register_ops(const struct frontswap_ops *ops);
@@ -22,6 +24,8 @@ extern int __frontswap_store(struct page *page);
 extern int __frontswap_load(struct page *page);
 extern void __frontswap_invalidate_page(unsigned, pgoff_t);
 extern void __frontswap_invalidate_area(unsigned);
+extern bool __frontswap_remove_from_lru(swp_entry_t);
+extern void __frontswap_insert_lru(swp_entry_t);
 
 #ifdef CONFIG_FRONTSWAP
 extern struct static_key_false frontswap_enabled_key;
@@ -86,6 +90,17 @@ static inline void frontswap_invalidate_area(unsigned type)
 {
 	if (frontswap_enabled())
 		__frontswap_invalidate_area(type);
+}
+
+static inline bool frontswap_remove_from_lru(swp_entry_t swpentry)
+{
+	return frontswap_enabled() && __frontswap_remove_from_lru(swpentry);
+}
+
+static inline void frontswap_insert_lru(swp_entry_t swpentry)
+{
+	if (frontswap_enabled())
+		__frontswap_insert_lru(swpentry);
 }
 
 #endif /* _LINUX_FRONTSWAP_H */

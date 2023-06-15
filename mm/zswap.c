@@ -1535,11 +1535,57 @@ static void zswap_frontswap_init(unsigned type)
 	zswap_trees[type] = tree;
 }
 
+typedef void (*modify_lru_fn)(struct list_head *entry,
+		struct list_head *pool_lru);
+
+/* modify_lru_fn wrapper for list_del_init() */
+static void lru_remove(struct list_head *entry, struct list_head *pool_lru)
+{
+	list_del_init(entry);
+}
+
+static bool modify_lru(swp_entry_t swpentry, modify_lru_fn modify)
+{
+	struct zswap_tree *tree = zswap_trees[swp_type(swpentry)];
+	struct zswap_entry *entry;
+	struct zswap_pool *pool;
+	bool modified = false;
+
+	/* get the zswap entry and prevent it from being freed */
+	spin_lock(&tree->lock);
+	entry = zswap_rb_search(&tree->rbroot, swp_offset(swpentry));
+	/* skip if the entry is already written back or is a same filled page */
+	if (!entry || !entry->length)
+		goto tree_unlock;
+
+	modified = true;
+	pool = entry->pool;
+	spin_lock(&pool->lru_lock);
+	modify(&entry->lru, &pool->lru);
+	spin_unlock(&pool->lru_lock);
+
+tree_unlock:
+	spin_unlock(&tree->lock);
+	return modified;
+}
+
+static bool zswap_frontswap_remove_from_lru(swp_entry_t swpentry)
+{
+	return modify_lru(swpentry, &lru_remove);
+}
+
+static void zswap_insert_lru(swp_entry_t swpentry)
+{
+	modify_lru(swpentry, &list_move);
+}
+
 static const struct frontswap_ops zswap_frontswap_ops = {
 	.store = zswap_frontswap_store,
 	.load = zswap_frontswap_load,
 	.invalidate_page = zswap_frontswap_invalidate_page,
 	.invalidate_area = zswap_frontswap_invalidate_area,
+	.remove_from_lru = zswap_frontswap_remove_from_lru,
+	.insert_lru = zswap_insert_lru,
 	.init = zswap_frontswap_init
 };
 
