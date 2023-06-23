@@ -35,6 +35,7 @@
 #include <linux/writeback.h>
 #include <linux/pagemap.h>
 #include <linux/workqueue.h>
+#include <linux/list_lru.h>
 
 #include "swap.h"
 #include "internal.h"
@@ -169,8 +170,8 @@ struct zswap_pool {
 	struct work_struct shrink_work;
 	struct hlist_node node;
 	char tfm_name[CRYPTO_MAX_ALG_NAME];
-	struct list_head lru;
-	spinlock_t lru_lock;
+	struct list_lru list_lru;
+	struct mem_cgroup *next_shrink;
 };
 
 /*
@@ -288,10 +289,20 @@ static void zswap_update_total_size(void)
 **********************************/
 static struct kmem_cache *zswap_entry_cache;
 
-static struct zswap_entry *zswap_entry_cache_alloc(gfp_t gfp)
+static struct zswap_entry *zswap_entry_cache_alloc(struct list_lru *lru, struct obj_cgroup *objcg,
+						   gfp_t gfp)
 {
 	struct zswap_entry *entry;
-	entry = kmem_cache_alloc(zswap_entry_cache, gfp);
+	struct mem_cgroup *memcg = NULL;
+
+	if (objcg)
+		memcg = set_active_memcg(objcg->memcg);
+
+	entry = kmem_cache_alloc_lru(zswap_entry_cache, lru, gfp);
+
+	if (objcg)
+		set_active_memcg(memcg);
+
 	if (!entry)
 		return NULL;
 	entry->refcount = 1;
@@ -378,9 +389,7 @@ static void zswap_free_entry(struct zswap_entry *entry)
 	if (!entry->length)
 		atomic_dec(&zswap_same_filled_pages);
 	else {
-		spin_lock(&entry->pool->lru_lock);
-		list_del(&entry->lru);
-		spin_unlock(&entry->pool->lru_lock);
+		list_lru_del(&entry->pool->list_lru, &entry->lru);
 		zpool_free(entry->pool->zpool, entry->handle);
 		zswap_pool_put(entry->pool);
 	}
@@ -613,21 +622,15 @@ static void zswap_invalidate_entry(struct zswap_tree *tree,
 		zswap_entry_put(tree, entry);
 }
 
-static int zswap_reclaim_entry(struct zswap_pool *pool)
+static enum lru_status shrink_memcg_cb(struct list_head *item, struct list_lru_one *l,
+				       spinlock_t *lock, void *arg)
 {
-	struct zswap_entry *entry;
+	struct zswap_entry *entry = container_of(item, struct zswap_entry, lru);
 	struct zswap_tree *tree;
 	pgoff_t swpoffset;
-	int ret;
+	enum lru_status ret = LRU_REMOVED_RETRY;
+	int writeback_result;
 
-	/* Get an entry off the LRU */
-	spin_lock(&pool->lru_lock);
-	if (list_empty(&pool->lru)) {
-		spin_unlock(&pool->lru_lock);
-		return -EINVAL;
-	}
-	entry = list_last_entry(&pool->lru, struct zswap_entry, lru);
-	list_del_init(&entry->lru);
 	/*
 	 * Once the lru lock is dropped, the entry might get freed. The
 	 * swpoffset is copied to the stack, and entry isn't deref'd again
@@ -635,26 +638,30 @@ static int zswap_reclaim_entry(struct zswap_pool *pool)
 	 */
 	swpoffset = swp_offset(entry->swpentry);
 	tree = zswap_trees[swp_type(entry->swpentry)];
-	spin_unlock(&pool->lru_lock);
+	list_lru_isolate(l, item);
+	spin_unlock(lock);
 
 	/* Check for invalidate() race */
 	spin_lock(&tree->lock);
 	if (entry != zswap_rb_search(&tree->rbroot, swpoffset)) {
-		ret = -EAGAIN;
 		goto unlock;
 	}
 	/* Hold a reference to prevent a free during writeback */
 	zswap_entry_get(entry);
 	spin_unlock(&tree->lock);
 
-	ret = zswap_writeback_entry(entry, tree);
+	writeback_result = zswap_writeback_entry(entry, tree);
 
 	spin_lock(&tree->lock);
-	if (ret) {
-		/* Writeback failed, put entry back on LRU */
-		spin_lock(&pool->lru_lock);
-		list_move(&entry->lru, &pool->lru);
-		spin_unlock(&pool->lru_lock);
+	if (writeback_result) {
+		zswap_reject_reclaim_fail++;
+
+		/* Check for invalidate() race */
+		if (entry != zswap_rb_search(&tree->rbroot, swpoffset))
+			goto put_unlock;
+
+		list_lru_add(&entry->pool->list_lru, &entry->lru);
+		ret = LRU_RETRY;
 		goto put_unlock;
 	}
 
@@ -670,7 +677,36 @@ put_unlock:
 	zswap_entry_put(tree, entry);
 unlock:
 	spin_unlock(&tree->lock);
-	return ret ? -EAGAIN : 0;
+	spin_lock(lock);
+	return ret;
+}
+
+static int shrink_memcg(struct mem_cgroup *memcg)
+{
+	struct zswap_pool *pool;
+	int nid, shrunk = 0;
+	bool is_empty = true;
+
+	pool = zswap_pool_current_get();
+	if (!pool)
+		return -EINVAL;
+
+	for_each_node_state(nid, N_NORMAL_MEMORY) {
+		unsigned long nr_to_walk = 1;
+
+		if (list_lru_walk_one(&pool->list_lru, nid, memcg, &shrink_memcg_cb,
+				      NULL, &nr_to_walk))
+			shrunk++;
+		if (!nr_to_walk)
+			is_empty = false;
+	}
+	zswap_pool_put(pool);
+
+	if (is_empty)
+		return -EINVAL;
+	if (shrunk)
+		return 0;
+	return -EAGAIN;
 }
 
 static void shrink_worker(struct work_struct *w)
@@ -680,9 +716,10 @@ static void shrink_worker(struct work_struct *w)
 	int ret, failures = 0;
 
 	do {
-		ret = zswap_reclaim_entry(pool);
+		ret = shrink_memcg(pool->next_shrink);
+		pool->next_shrink = mem_cgroup_iter(NULL, pool->next_shrink, NULL);
+
 		if (ret) {
-			zswap_reject_reclaim_fail++;
 			if (ret != -EAGAIN)
 				break;
 			if (++failures == MAX_RECLAIM_RETRIES)
@@ -744,9 +781,8 @@ static struct zswap_pool *zswap_pool_create(char *type, char *compressor)
 	 */
 	kref_init(&pool->kref);
 	INIT_LIST_HEAD(&pool->list);
-	INIT_LIST_HEAD(&pool->lru);
-	spin_lock_init(&pool->lru_lock);
 	INIT_WORK(&pool->shrink_work, shrink_worker);
+	list_lru_init_memcg(&pool->list_lru, NULL);
 
 	zswap_pool_debug("created", pool);
 
@@ -1232,15 +1268,12 @@ static int zswap_frontswap_store(unsigned type, pgoff_t offset,
 		goto reject;
 	}
 
-	/*
-	 * XXX: zswap reclaim does not work with cgroups yet. Without a
-	 * cgroup-aware entry LRU, we will push out entries system-wide based on
-	 * local cgroup limits.
-	 */
 	objcg = get_obj_cgroup_from_page(page);
 	if (objcg && !obj_cgroup_may_zswap(objcg)) {
-		ret = -ENOMEM;
-		goto reject;
+		if (!shrink_memcg(objcg->memcg)) {
+			ret = -ENOMEM;
+			goto reject;
+		}
 	}
 
 	/* reclaim space if needed */
@@ -1257,12 +1290,17 @@ static int zswap_frontswap_store(unsigned type, pgoff_t offset,
 		} else
 			zswap_pool_reached_full = false;
 	}
-
+	pool = zswap_pool_current_get();
+	if (!pool) {
+		ret = -EINVAL;
+		goto reject;
+	}
 	/* allocate entry */
-	entry = zswap_entry_cache_alloc(GFP_KERNEL);
+	entry = zswap_entry_cache_alloc(&pool->list_lru, objcg, GFP_KERNEL);
 	if (!entry) {
 		zswap_reject_kmemcache_fail++;
 		ret = -ENOMEM;
+		zswap_pool_put(pool);
 		goto reject;
 	}
 
@@ -1274,6 +1312,7 @@ static int zswap_frontswap_store(unsigned type, pgoff_t offset,
 			entry->length = 0;
 			entry->value = value;
 			atomic_inc(&zswap_same_filled_pages);
+			zswap_pool_put(pool);
 			goto insert_entry;
 		}
 		kunmap_atomic(src);
@@ -1281,15 +1320,12 @@ static int zswap_frontswap_store(unsigned type, pgoff_t offset,
 
 	if (!zswap_non_same_filled_pages_enabled) {
 		ret = -EINVAL;
+		zswap_pool_put(pool);
 		goto freepage;
 	}
 
 	/* if entry is successfully added, it keeps the reference */
-	entry->pool = zswap_pool_current_get();
-	if (!entry->pool) {
-		ret = -EINVAL;
-		goto freepage;
-	}
+	entry->pool = pool;
 
 	/* compress */
 	acomp_ctx = raw_cpu_ptr(entry->pool->acomp_ctx);
@@ -1366,9 +1402,8 @@ insert_entry:
 		}
 	} while (ret == -EEXIST);
 	if (entry->length) {
-		spin_lock(&entry->pool->lru_lock);
-		list_add(&entry->lru, &entry->pool->lru);
-		spin_unlock(&entry->pool->lru_lock);
+		INIT_LIST_HEAD(&entry->lru);
+		list_lru_add(&pool->list_lru, &entry->lru);
 	}
 	spin_unlock(&tree->lock);
 
@@ -1473,9 +1508,8 @@ freeentry:
 		zswap_invalidate_entry(tree, entry);
 		*exclusive = true;
 	} else if (entry->length) {
-		spin_lock(&entry->pool->lru_lock);
-		list_move(&entry->lru, &entry->pool->lru);
-		spin_unlock(&entry->pool->lru_lock);
+		list_lru_del(&entry->pool->list_lru, &entry->lru);
+		list_lru_add(&entry->pool->list_lru, &entry->lru);
 	}
 	zswap_entry_put(tree, entry);
 	spin_unlock(&tree->lock);
@@ -1535,14 +1569,8 @@ static void zswap_frontswap_init(unsigned type)
 	zswap_trees[type] = tree;
 }
 
-typedef void (*modify_lru_fn)(struct list_head *entry,
-		struct list_head *pool_lru);
-
-/* modify_lru_fn wrapper for list_del_init() */
-static void lru_remove(struct list_head *entry, struct list_head *pool_lru)
-{
-	list_del_init(entry);
-}
+typedef bool (*modify_lru_fn)(struct list_lru *lru,
+		struct list_head *entry);
 
 static bool modify_lru(swp_entry_t swpentry, modify_lru_fn modify)
 {
@@ -1558,11 +1586,8 @@ static bool modify_lru(swp_entry_t swpentry, modify_lru_fn modify)
 	if (!entry || !entry->length)
 		goto tree_unlock;
 
-	modified = true;
 	pool = entry->pool;
-	spin_lock(&pool->lru_lock);
-	modify(&entry->lru, &pool->lru);
-	spin_unlock(&pool->lru_lock);
+	modified = modify(&pool->list_lru, &entry->lru);
 
 tree_unlock:
 	spin_unlock(&tree->lock);
@@ -1571,12 +1596,12 @@ tree_unlock:
 
 static bool zswap_frontswap_remove_from_lru(swp_entry_t swpentry)
 {
-	return modify_lru(swpentry, &lru_remove);
+	return modify_lru(swpentry, &list_lru_del);
 }
 
 static void zswap_insert_lru(swp_entry_t swpentry)
 {
-	modify_lru(swpentry, &list_move);
+	modify_lru(swpentry, &list_lru_add);
 }
 
 static const struct frontswap_ops zswap_frontswap_ops = {
@@ -1642,7 +1667,7 @@ static int zswap_setup(void)
 	struct zswap_pool *pool;
 	int ret;
 
-	zswap_entry_cache = KMEM_CACHE(zswap_entry, 0);
+	zswap_entry_cache = KMEM_CACHE(zswap_entry, SLAB_ACCOUNT);
 	if (!zswap_entry_cache) {
 		pr_err("entry cache creation failed\n");
 		goto cache_fail;
