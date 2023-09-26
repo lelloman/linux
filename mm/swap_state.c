@@ -412,13 +412,13 @@ struct folio *filemap_get_incore_folio(struct address_space *mapping,
 
 struct page *__read_swap_cache_async(swp_entry_t entry, gfp_t gfp_mask,
 			struct vm_area_struct *vma, unsigned long addr,
-			bool *new_page_allocated)
+			bool *new_page_allocated, bool do_the_trick)
 {
 	struct swap_info_struct *si;
 	struct folio *folio;
 	struct page *page;
 	void *shadow = NULL;
-	bool zswap_lru_removed = false;
+	//bool zswap_lru_removed = false;
 
 	*new_page_allocated = false;
 	si = get_swap_device(entry);
@@ -470,6 +470,9 @@ struct page *__read_swap_cache_async(swp_entry_t entry, gfp_t gfp_mask,
 		if (err != -EEXIST)
 			goto fail_put_swap;
 
+		if (do_the_trick && err == -EEXIST)
+			goto fail_put_swap;
+
 		/*
 		 * We might race against __delete_from_swap_cache(), and
 		 * stumble across a swap_map entry whose SWAP_HAS_CACHE
@@ -496,7 +499,7 @@ struct page *__read_swap_cache_async(swp_entry_t entry, gfp_t gfp_mask,
 	 * To prevent this from happening, we remove it from the zswap
 	 * LRU to prevent its reclamation.
 	 */
-	zswap_lru_removed = zswap_remove_swpentry_from_lru(entry);
+	//zswap_lru_removed = zswap_remove_swpentry_from_lru(entry);
 
 	if (mem_cgroup_swapin_charge_folio(folio, NULL, gfp_mask, entry))
 		goto fail_unlock;
@@ -510,8 +513,8 @@ struct page *__read_swap_cache_async(swp_entry_t entry, gfp_t gfp_mask,
 	if (shadow)
 		workingset_refault(folio, shadow);
 
-	if (zswap_lru_removed)
-		zswap_insert_swpentry_into_lru(entry);
+	//if (zswap_lru_removed)
+	//	zswap_insert_swpentry_into_lru(entry);
 
 	/* Caller will initiate read into locked folio */
 	folio_add_lru(folio);
@@ -522,8 +525,8 @@ got_page:
 	return page;
 
 fail_unlock:
-	if (zswap_lru_removed)
-		zswap_insert_swpentry_into_lru(entry);
+	//if (zswap_lru_removed)
+	//	zswap_insert_swpentry_into_lru(entry);
 
 	put_swap_folio(folio, entry);
 	folio_unlock(folio);
@@ -549,7 +552,7 @@ struct page *read_swap_cache_async(swp_entry_t entry, gfp_t gfp_mask,
 {
 	bool page_was_allocated;
 	struct page *retpage = __read_swap_cache_async(entry, gfp_mask,
-			vma, addr, &page_was_allocated);
+			vma, addr, &page_was_allocated, false);
 
 	if (page_was_allocated)
 		swap_readpage(retpage, false, plug);
@@ -684,7 +687,7 @@ struct page *swap_cluster_readahead(swp_entry_t entry, gfp_t gfp_mask,
 		/* Ok, do the async read-ahead now */
 		page = __read_swap_cache_async(
 			swp_entry(swp_type(entry), offset),
-			gfp_mask, vma, addr, &page_allocated);
+			gfp_mask, vma, addr, &page_allocated, false);
 		if (!page)
 			continue;
 		if (page_allocated) {
@@ -855,7 +858,7 @@ static struct page *swap_vma_readahead(swp_entry_t fentry, gfp_t gfp_mask,
 		pte_unmap(pte);
 		pte = NULL;
 		page = __read_swap_cache_async(entry, gfp_mask, vma,
-					       addr, &page_allocated);
+					       addr, &page_allocated, false);
 		if (!page)
 			continue;
 		if (page_allocated) {

@@ -1318,7 +1318,7 @@ static int zswap_writeback_entry(struct zswap_entry *entry,
 
 	/* try to allocate swap cache page */
 	page = __read_swap_cache_async(swpentry, GFP_KERNEL, NULL, 0,
-				       &page_was_allocated);
+				       &page_was_allocated, true);
 	if (!page) {
 		ret = -ENOMEM;
 		goto fail;
